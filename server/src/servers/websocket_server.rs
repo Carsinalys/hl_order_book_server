@@ -134,6 +134,11 @@ async fn handle_socket(
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
                                 }
                             },
+                            InternalMessage::L4Snapshot{ snapshot } => {
+                                for sub in manager.subscriptions() {
+                                    send_ws_l4_snapshot(&mut socket, sub, snapshot).await;
+                                }
+                            },
                         }
 
                     }
@@ -339,6 +344,36 @@ async fn send_ws_data_from_trades(
     if let Subscription::Trades { coin } = subscription {
         if let Some(trades) = trades.remove(coin) {
             let msg = ServerResponse::Trades(trades);
+            send_socket_message(socket, msg).await;
+        }
+    }
+}
+
+async fn send_ws_l4_snapshot(
+    socket: &mut WebSocket,
+    subscription: &Subscription,
+    timed_snapshot: &TimedSnapshots,
+) {
+    if let Subscription::L4Book { coin } = subscription {
+        let TimedSnapshots { time, height, snapshot } = timed_snapshot;
+        let coin_snapshot = snapshot
+            .clone()
+            .value()
+            .into_iter()
+            .filter(|(c, _)| *c == Coin::new(coin))
+            .collect::<Vec<_>>()
+            .pop();
+        if let Some((coin_key, orders)) = coin_snapshot {
+            let levels = orders
+                .as_ref()
+                .clone()
+                .map(|orders| orders.into_iter().map(L4Order::from).collect());
+            let msg = ServerResponse::L4Book(L4Book::Snapshot {
+                coin: coin_key.value(),
+                time: *time,
+                height: *height,
+                levels,
+            });
             send_socket_message(socket, msg).await;
         }
     }

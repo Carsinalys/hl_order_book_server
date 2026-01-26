@@ -407,6 +407,14 @@ impl OrderBookListener {
 
         self.order_book_state = Some(new_order_book);
 
+        // Broadcast L4 snapshot to all connected clients so they can resync their state
+        // Compute snapshot first to avoid borrow conflict with internal_message_tx
+        let snapshot_to_send = self.compute_snapshot();
+        if let (Some(internal_message_tx), Some(snapshot)) = (&self.internal_message_tx, snapshot_to_send) {
+            let msg = Arc::new(InternalMessage::L4Snapshot { snapshot });
+            let _ = internal_message_tx.send(msg);
+        }
+
         info!(
             "RESYNC #{}: Orderbook resynced successfully at height {}. Total resyncs: {}",
             self.resync_count, height, self.resync_count
@@ -551,6 +559,7 @@ pub(crate) enum InternalMessage {
     Snapshot { l2_snapshots: L2Snapshots, time: u64 },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
+    L4Snapshot { snapshot: TimedSnapshots },
 }
 
 #[derive(Eq, PartialEq, Hash)]
