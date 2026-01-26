@@ -1,5 +1,4 @@
 use crate::{
-    HL_NODE,
     listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
     order_book::{
         Coin, Snapshot,
@@ -109,10 +108,10 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
             snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
                 match snapshot_fetch_res {
                     None => {
-                        return Err("Snapshot fetch task sender dropped".into());
+                        error!("Snapshot fetch task sender dropped - this shouldn't happen");
                     }
                     Some(Err(err)) => {
-                        return Err(format!("Abci state reading error: {err}").into());
+                        warn!("Snapshot fetch failed: {err}. Will retry on next tick.");
                     }
                     Some(Ok(())) => {}
                 }
@@ -122,10 +121,10 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                 fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
             }
-            () = sleep(Duration::from_secs(5)) => {
+            () = sleep(Duration::from_secs(60)) => {
                 let listener = listener.lock().await;
                 if listener.is_ready() {
-                    return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
+                    warn!("No file system events received for 60 seconds. HL node may be stalled.");
                 }
             }
         }
