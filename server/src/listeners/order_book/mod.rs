@@ -21,7 +21,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     sync::{
@@ -32,6 +32,11 @@ use tokio::{
     time::{Instant, interval_at, sleep},
 };
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
+
+// Circuit breaker configuration
+const CIRCUIT_BREAKER_MAX_RESYNCS: usize = 5;
+const CIRCUIT_BREAKER_WINDOW_SECS: u64 = 60;
+const CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 300; // 5 minutes cooldown
 
 mod state;
 mod utils;
@@ -227,10 +232,17 @@ pub(crate) struct OrderBookListener {
     // Track resync statistics
     resync_count: u64,
     last_resync_height: Option<u64>,
+    // Fix #1: Line-buffered reading - incomplete line buffers per event source
+    fill_incomplete_line: String,
+    order_status_incomplete_line: String,
+    order_diff_incomplete_line: String,
+    // Fix #2: Circuit breaker state
+    resync_timestamps: VecDeque<SystemTime>,
+    degraded_mode_until: Option<SystemTime>,
 }
 
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
         Self {
             ignore_spot,
             fill_status_file: None,
@@ -244,6 +256,13 @@ impl OrderBookListener {
             order_status_cache: BatchQueue::new(),
             resync_count: 0,
             last_resync_height: None,
+            // Fix #1: Initialize empty incomplete line buffers
+            fill_incomplete_line: String::new(),
+            order_status_incomplete_line: String::new(),
+            order_diff_incomplete_line: String::new(),
+            // Fix #2: Initialize circuit breaker state
+            resync_timestamps: VecDeque::new(),
+            degraded_mode_until: None,
         }
     }
 
@@ -359,18 +378,79 @@ impl OrderBookListener {
         }
     }
 
+    /// Check if circuit breaker is currently active (in degraded mode)
+    fn is_circuit_breaker_active(&self) -> bool {
+        if let Some(until) = self.degraded_mode_until {
+            if SystemTime::now() < until {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if we should trip the circuit breaker based on recent resync frequency
+    fn should_trip_circuit_breaker(&mut self) -> bool {
+        let now = SystemTime::now();
+        let window_start = now - Duration::from_secs(CIRCUIT_BREAKER_WINDOW_SECS);
+
+        // Remove old timestamps outside the window
+        while let Some(front) = self.resync_timestamps.front() {
+            if *front < window_start {
+                self.resync_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Check if we've exceeded the threshold
+        self.resync_timestamps.len() >= CIRCUIT_BREAKER_MAX_RESYNCS
+    }
+
     /// Resync the orderbook state from a new snapshot after validation failure.
     /// This is Option C from the debugging guide - auto-resync on mismatch.
     ///
     /// Corner cases handled:
-    /// 1. Clears old state completely before reinitializing
-    /// 2. Clears stale caches to prevent applying outdated updates
-    /// 3. Tracks resync count for monitoring
-    /// 4. Logs detailed information for debugging
-    /// 5. If resync fails, state remains None and next snapshot will retry
+    /// 1. Circuit breaker prevents rapid resyncs (Fix #2)
+    /// 2. Clears old state completely before reinitializing
+    /// 3. Clears stale caches to prevent applying outdated updates
+    /// 4. Tracks resync count for monitoring
+    /// 5. Logs detailed information for debugging
+    /// 6. If resync fails, state remains None and next snapshot will retry
     fn resync_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         let old_height = self.order_book_state.as_ref().map(|s| s.height());
+
+        // Fix #2: Check circuit breaker - if active, skip resync
+        if self.is_circuit_breaker_active() {
+            warn!(
+                "RESYNC BLOCKED: Circuit breaker active. Skipping resync at height {} (previous height: {:?}). \
+                 Server is in degraded mode until {:?}. Serving potentially stale data.",
+                height, old_height, self.degraded_mode_until
+            );
+            return;
+        }
+
+        // Record this resync attempt for circuit breaker
+        self.resync_timestamps.push_back(SystemTime::now());
         self.resync_count += 1;
+
+        // Fix #2: Check if we should trip the circuit breaker
+        if self.should_trip_circuit_breaker() {
+            let cooldown_until = SystemTime::now() + Duration::from_secs(CIRCUIT_BREAKER_COOLDOWN_SECS);
+            self.degraded_mode_until = Some(cooldown_until);
+            error!(
+                "CIRCUIT BREAKER TRIPPED: {} resyncs in {} seconds. \
+                 Entering degraded mode for {} seconds. \
+                 Server will serve potentially stale data and skip resyncs until {:?}. \
+                 Total resyncs: {}",
+                CIRCUIT_BREAKER_MAX_RESYNCS,
+                CIRCUIT_BREAKER_WINDOW_SECS,
+                CIRCUIT_BREAKER_COOLDOWN_SECS,
+                cooldown_until,
+                self.resync_count
+            );
+            // Don't perform this resync - we just tripped the breaker
+            return;
+        }
 
         warn!(
             "RESYNC #{}: Reinitializing orderbook from snapshot at height {} (previous height: {:?})",
@@ -382,8 +462,9 @@ impl OrderBookListener {
             if height <= last_height + 10 {
                 warn!(
                     "RESYNC WARNING: Rapid resync detected! Last resync at height {}, now at {}. \
-                     This may indicate persistent state divergence issues.",
-                    last_height, height
+                     This may indicate persistent state divergence issues. \
+                     Recent resyncs in window: {}",
+                    last_height, height, self.resync_timestamps.len()
                 );
             }
         }
@@ -412,7 +493,7 @@ impl OrderBookListener {
         let snapshot_to_send = self.compute_snapshot();
         if let (Some(internal_message_tx), Some(snapshot)) = (&self.internal_message_tx, snapshot_to_send) {
             let msg = Arc::new(InternalMessage::L4Snapshot { snapshot });
-            let _ = internal_message_tx.send(msg);
+            let _unused = internal_message_tx.send(msg);
         }
 
         info!(
@@ -475,24 +556,69 @@ impl DirectoryListener for OrderBookListener {
     }
 
     fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource) -> Result<()> {
+        // Fix #1: Process remaining data from old file with line-buffered reading
         if let Some(file) = self.file_mut(event_source).as_mut() {
             let mut buf = String::new();
             file.read_to_string(&mut buf)?;
             if !buf.is_empty() {
-                self.process_data(buf, event_source)?;
+                // Use line-buffered processing - any incomplete line is saved
+                self.process_data_line_buffered(buf, event_source)?;
             }
         }
+        // Clear incomplete line buffer when switching to new file
+        // (incomplete data from old file is lost, but that's expected at file boundaries)
+        self.incomplete_line_mut(event_source).clear();
         *self.file_mut(event_source) = Some(File::open(new_file)?);
         Ok(())
     }
 
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
-        let total_len = data.len();
-        let lines = data.lines();
+        // Fix #1: Delegate to line-buffered implementation
+        self.process_data_line_buffered(data, event_source)
+    }
+}
+
+// Fix #1: Line-buffered reading implementation
+impl OrderBookListener {
+    /// Get mutable reference to the incomplete line buffer for an event source
+    fn incomplete_line_mut(&mut self, event_source: EventSource) -> &mut String {
+        match event_source {
+            EventSource::Fills => &mut self.fill_incomplete_line,
+            EventSource::OrderStatuses => &mut self.order_status_incomplete_line,
+            EventSource::OrderDiffs => &mut self.order_diff_incomplete_line,
+        }
+    }
+
+    /// Process data with line-buffered reading.
+    /// Only processes complete lines (ending with \n).
+    /// Incomplete trailing data is saved for the next read.
+    fn process_data_line_buffered(&mut self, data: String, event_source: EventSource) -> Result<()> {
+        // Prepend any incomplete line from previous read
+        let incomplete = std::mem::take(self.incomplete_line_mut(event_source));
+        let full_data = if incomplete.is_empty() {
+            data
+        } else {
+            incomplete + &data
+        };
+
+        // Check if data ends with newline (complete) or not (incomplete trailing line)
+        let ends_with_newline = full_data.ends_with('\n');
+
+        let mut lines: Vec<&str> = full_data.lines().collect();
+
+        // If data doesn't end with newline, the last "line" is incomplete
+        // Save it for next read and don't process it
+        if !ends_with_newline && !lines.is_empty() {
+            let incomplete_line = lines.pop().unwrap_or("");
+            *self.incomplete_line_mut(event_source) = incomplete_line.to_string();
+        }
+
+        // Process only complete lines
         for line in lines {
             if line.is_empty() {
                 continue;
             }
+
             let res = match event_source {
                 EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(line).map(|batch| {
                     let height = batch.block_number();
@@ -503,29 +629,35 @@ impl DirectoryListener for OrderBookListener {
                 EventSource::OrderDiffs => serde_json::from_str(line)
                     .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
             };
+
             let (height, event_batch) = match res {
                 Ok(data) => data,
                 Err(err) => {
-                    // if we run into a serialization error (hitting EOF), just return to last line.
+                    // This should be rare now - only happens if the node writes malformed JSON
+                    // (not due to partial reads, which are now handled by line buffering)
+                    let line_preview = if line.len() > 100 { &line[..100] } else { line };
                     error!(
-                        "{event_source} serialization error {err}, height: {:?}, line: {:?}",
+                        "{event_source} JSON parse error on COMPLETE line: {err}, height: {:?}, line preview: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
+                        line_preview,
                     );
-                    #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
-                    break;
+                    // Skip this malformed line and continue with next
+                    // (Don't seek back - the line was complete but malformed)
+                    continue;
                 }
             };
+
             if height % 100 == 0 {
                 info!("{event_source} block: {height}");
             }
+
             if let Err(err) = self.receive_batch(event_batch) {
                 self.order_book_state = None;
                 return Err(err);
             }
         }
+
+        // Send L2 snapshot if ready
         let snapshot = self.l2_snapshots(true);
         if let Some(snapshot) = snapshot {
             if let Some(tx) = &self.internal_message_tx {
