@@ -36,7 +36,7 @@ use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consiste
 // Circuit breaker configuration
 const CIRCUIT_BREAKER_MAX_RESYNCS: usize = 5;
 const CIRCUIT_BREAKER_WINDOW_SECS: u64 = 60;
-const CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 300; // 5 minutes cooldown
+const CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 60; // 1 minute cooldown (reduced from 5 min since cache fix should make resyncs rare)
 
 mod state;
 mod utils;
@@ -144,16 +144,21 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
+        // Fix #3: Start caching BEFORE the HTTP request
+        // This ensures we capture updates that happen while the snapshot is being generated
+        let state = {
+            let mut listener = listener.lock().await;
+            listener.begin_caching();
+            listener.clone_state()
+        };
+        let state_height = state.as_ref().map(|s| s.height());
+        info!("Started caching for snapshot validation (current state height: {:?})", state_height);
+
         let res = match process_rmp_file(&dir).await {
             Ok(output_fln) => {
-                let state = {
-                    let mut listener = listener.lock().await;
-                    listener.begin_caching();
-                    listener.clone_state()
-                };
                 let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
                 info!("Snapshot fetched");
-                // sleep to let some updates build up.
+                // sleep to let some updates build up after snapshot was taken
                 sleep(Duration::from_secs(1)).await;
                 let mut cache = {
                     let mut listener = listener.lock().await;
@@ -163,18 +168,23 @@ fn fetch_snapshot(
                 match snapshot {
                     Ok((height, expected_snapshot)) => {
                         if let Some(mut state) = state {
+                            info!("Attempting to reach snapshot height {} from state height {}", height, state.height());
                             // Try to bring our state up to the snapshot height
                             while state.height() < height {
                                 if let Some((order_statuses, order_diffs)) = cache.pop_front() {
+                                    let update_height = order_statuses.block_number();
                                     if let Err(e) = state.apply_updates(order_statuses, order_diffs) {
                                         // Failed to apply updates - resync from snapshot
-                                        warn!("Failed to apply cached updates: {}. Resyncing from snapshot...", e);
+                                        warn!("Failed to apply cached update at height {}: {}. Resyncing from snapshot...", update_height, e);
                                         listener.lock().await.resync_from_snapshot(expected_snapshot, height);
                                         return Ok::<(), Error>(());
                                     }
                                 } else {
                                     // Not enough cached updates - resync from snapshot
-                                    warn!("Not enough cached updates to reach snapshot height. Resyncing from snapshot...");
+                                    warn!(
+                                        "Not enough cached updates to reach snapshot height {}. Current state: {}, cache exhausted. Resyncing from snapshot...",
+                                        height, state.height()
+                                    );
                                     listener.lock().await.resync_from_snapshot(expected_snapshot, height);
                                     return Ok::<(), Error>(());
                                 }
@@ -209,7 +219,12 @@ fn fetch_snapshot(
                     Err(err) => Err(err),
                 }
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                // HTTP request failed - stop caching
+                let mut listener = listener.lock().await;
+                listener.take_cache(); // Discard cache
+                Err(err)
+            }
         };
         let _unused = tx.send(res);
         Ok(())
