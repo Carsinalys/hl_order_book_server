@@ -19,7 +19,6 @@ pub(super) struct OrderBookState {
     time: u64,
     snapped: bool,
     ignore_spot: bool,
-    tracked_coins: HashSet<Coin>,
 }
 
 impl OrderBookState {
@@ -29,16 +28,13 @@ impl OrderBookState {
         time: u64,
         ignore_triggers: bool,
         ignore_spot: bool,
-        tracked_coins: HashSet<Coin>,
     ) -> Self {
-        let filtered = snapshot.filter_coins(&tracked_coins);
         Self {
             ignore_spot,
             time,
             height,
-            order_book: OrderBooks::from_snapshots(filtered, ignore_triggers),
+            order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             snapped: false,
-            tracked_coins,
         }
     }
 
@@ -46,17 +42,23 @@ impl OrderBookState {
         self.height
     }
 
+    // forcibly take snapshot - (time, height, snapshot)
     pub(super) fn compute_snapshot(&self) -> TimedSnapshots {
         TimedSnapshots { time: self.time, height: self.height, snapshot: self.order_book.to_snapshots_par() }
     }
 
+    // (time, snapshot)
     pub(super) fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
         if self.snapped {
             None
         } else {
             self.snapped = prevent_future_snaps || self.snapped;
-            Some((self.time, compute_l2_snapshots(&self.order_book, &self.tracked_coins)))
+            Some((self.time, compute_l2_snapshots(&self.order_book)))
         }
+    }
+
+    pub(super) fn compute_universe(&self) -> HashSet<Coin> {
+        self.order_book.as_ref().keys().cloned().collect()
     }
 
     pub(super) fn apply_updates(
@@ -70,6 +72,7 @@ impl OrderBookState {
         if height > self.height + 1 {
             return Err(format!("Expecting block {}, got block {}", self.height + 1, height).into());
         } else if height <= self.height {
+            // This is not an error in case we started caching long before a snapshot is fetched
             return Ok(());
         }
         let mut diffs = order_diffs.events().into_iter().collect::<VecDeque<_>>();
@@ -90,12 +93,6 @@ impl OrderBookState {
             if coin.is_spot() && self.ignore_spot {
                 continue;
             }
-            if self.tracked_coins.is_empty() || !self.tracked_coins.contains(&coin) {
-                continue;
-            }
-            if !self.order_book.as_ref().contains_key(&coin) {
-                continue;
-            }
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
                 InnerOrderDiff::New { sz } => {
@@ -103,6 +100,7 @@ impl OrderBookState {
                         let time = order.time.and_utc().timestamp_millis();
                         let mut inner_order: InnerL4Order = order.try_into()?;
                         inner_order.modify_sz(sz);
+                        // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
                         self.order_book.add_order(inner_order);
@@ -127,13 +125,4 @@ impl OrderBookState {
         self.snapped = false;
         Ok(())
     }
-
-    pub(super) fn remove_coin(&mut self, coin: &Coin) {
-        self.order_book.remove_coin(coin);
-    }
-
-    pub(super) fn set_tracked_coins(&mut self, coins: HashSet<Coin>) {
-        self.tracked_coins = coins;
-    }
-
 }

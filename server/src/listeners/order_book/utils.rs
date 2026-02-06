@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
     order_book::{
-        Coin, Snapshot,
+        Snapshot,
         multi_book::{OrderBooks, Snapshots},
         types::InnerOrder,
     },
@@ -14,7 +14,7 @@ use crate::{
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use reqwest::Client;
 use serde_json::json;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -48,18 +48,12 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
     snapshot: &Snapshots<O>,
     expected: Snapshots<O>,
     ignore_spot: bool,
-    tracked_coins: &HashSet<Coin>,
 ) -> Result<()> {
     let mut snapshot_map: HashMap<_, _> =
-        expected.value().into_iter()
-            .filter(|(c, _)| (!c.is_spot() || !ignore_spot) && tracked_coins.contains(c))
-            .collect();
+        expected.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
 
     for (coin, book) in snapshot.as_ref() {
         if ignore_spot && coin.is_spot() {
-            continue;
-        }
-        if !tracked_coins.contains(coin) {
             continue;
         }
         let book1 = book.as_ref();
@@ -89,12 +83,11 @@ impl L2SnapshotParams {
     }
 }
 
-pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &OrderBooks<O>, tracked_coins: &HashSet<Coin>) -> L2Snapshots {
+pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &OrderBooks<O>) -> L2Snapshots {
     L2Snapshots(
         order_books
             .as_ref()
             .par_iter()
-            .filter(|(coin, _)| !tracked_coins.is_empty() && tracked_coins.contains(coin))
             .map(|(coin, order_book)| {
                 let mut entries = Vec::new();
                 let snapshot = order_book.to_l2_snapshot(None, None, None);
