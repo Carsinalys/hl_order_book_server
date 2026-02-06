@@ -27,6 +27,12 @@ pub(crate) enum Subscription {
 }
 
 impl Subscription {
+    pub(crate) fn coin_name(&self) -> &str {
+        match self {
+            Self::Trades { coin } | Self::L2Book { coin, .. } | Self::L4Book { coin } => coin,
+        }
+    }
+
     pub(crate) fn validate(&self, universe: &HashSet<String>) -> bool {
         match self {
             Self::Trades { coin } => universe.contains(coin),

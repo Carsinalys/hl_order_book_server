@@ -1,6 +1,6 @@
 use crate::{
     listeners::order_book::{
-        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
+        InternalMessage, L2SnapshotParams, OrderBookListener, TimedSnapshots, hl_listen,
     },
     order_book::{Coin, Snapshot},
     prelude::*,
@@ -13,7 +13,7 @@ use crate::{
 };
 use axum::{Router, response::IntoResponse, routing::get};
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info};
+use log::{error, info, warn};
 use std::{
     collections::{HashMap, HashSet},
     env::home_dir,
@@ -99,12 +99,12 @@ async fn handle_socket(
     mut socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
-    ignore_spot: bool,
+    _ignore_spot: bool,
 ) {
     let mut internal_message_rx = internal_message_tx.subscribe();
     let is_ready = listener.lock().await.is_ready();
     let mut manager = SubscriptionManager::default();
-    let mut universe = listener.lock().await.universe().into_iter().map(|c| c.value()).collect();
+    let mut universe = listener.lock().await.universe();
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
         send_socket_message(&mut socket, msg).await;
@@ -117,7 +117,7 @@ async fn handle_socket(
                     Ok(msg) => {
                         match msg.as_ref() {
                             InternalMessage::Snapshot{ l2_snapshots, time } => {
-                                universe = new_universe(l2_snapshots, ignore_spot);
+                                universe = listener.lock().await.universe();
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
                                 }
@@ -144,7 +144,7 @@ async fn handle_socket(
                     }
                     Err(err) => {
                         error!("Receiver error: {err}");
-                        return;
+                        break;
                     }
                 }
             }
@@ -157,8 +157,7 @@ async fn handle_socket(
                                 Ok(text) => text,
                                 Err(err) => {
                                     log::warn!("unable to parse websocket content: {err}: {:?}", frame.payload.as_ref());
-                                    // deserves to close the connection because the payload is not a valid utf8 string.
-                                    return;
+                                    break;
                                 }
                             };
 
@@ -174,16 +173,25 @@ async fn handle_socket(
                         }
                         OpCode::Close => {
                             info!("Client disconnected");
-                            return;
+                            break;
                         }
                         _ => {}
                     }
                 } else {
                     info!("Client connection closed");
-                    return;
+                    break;
                 }
             }
         }
+    }
+
+    // Cleanup: untrack all coins this client was subscribed to
+    let client_coins: Vec<Coin> = manager.subscriptions().iter()
+        .map(|sub| Coin::new(sub.coin_name()))
+        .collect();
+    if !client_coins.is_empty() {
+        info!("Untracking {} coins for disconnected client", client_coins.len());
+        listener.lock().await.untrack_coins(&client_coins);
     }
 }
 
@@ -197,7 +205,6 @@ async fn receive_client_message(
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
     };
-    // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
     if !subscription.validate(universe) {
         let msg = ServerResponse::Error(format!("Invalid subscription: {sub}"));
@@ -209,15 +216,24 @@ async fn receive_client_message(
         ClientMessage::Unsubscribe { .. } => ("un", manager.unsubscribe(subscription)),
     };
     if success {
+        if let ClientMessage::Subscribe { subscription } = &client_message {
+            let coin = Coin::new(subscription.coin_name());
+            let is_new = listener.lock().await.track_coin(coin);
+            if is_new {
+                info!("New coin tracked: {}", subscription.coin_name());
+            }
+        } else if let ClientMessage::Unsubscribe { subscription } = &client_message {
+            let coin = Coin::new(subscription.coin_name());
+            listener.lock().await.untrack_coin(&coin);
+        }
+
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
             let msg = subscription.handle_immediate_snapshot(listener).await;
             match msg {
                 Ok(msg) => msg,
                 Err(err) => {
-                    manager.unsubscribe(subscription.clone());
-                    let msg = ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"));
-                    send_socket_message(socket, msg).await;
-                    return;
+                    warn!("Snapshot not available for {} yet (will be ready after next fetch): {err}", subscription.coin_name());
+                    None
                 }
             }
         } else {
@@ -246,15 +262,6 @@ async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
             error!("Server response serialization error: {err}");
         }
     }
-}
-
-// derive it from l2_snapshots because thats convenient
-fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String> {
-    l2_snapshots
-        .as_ref()
-        .iter()
-        .filter_map(|(c, _)| if !c.is_spot() || !ignore_spot { Some(c.clone().value()) } else { None })
-        .collect()
 }
 
 async fn send_ws_data_from_snapshot(
@@ -380,7 +387,6 @@ async fn send_ws_l4_snapshot(
 }
 
 impl Subscription {
-    // snapshots that begin a stream
     async fn handle_immediate_snapshot(
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
@@ -401,7 +407,9 @@ impl Subscription {
                     })));
                 }
             }
-            return Err("Snapshot Failed".into());
+            // Coin not in state yet — subscription succeeds but snapshot will arrive
+            // via L4Snapshot broadcast after next fetch_snapshot includes this coin
+            return Ok(None);
         }
         Ok(None)
     }
