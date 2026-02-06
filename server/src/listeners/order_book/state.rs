@@ -19,7 +19,6 @@ pub(super) struct OrderBookState {
     time: u64,
     snapped: bool,
     ignore_spot: bool,
-    tracked_coins: HashSet<Coin>,
 }
 
 impl OrderBookState {
@@ -29,16 +28,13 @@ impl OrderBookState {
         time: u64,
         ignore_triggers: bool,
         ignore_spot: bool,
-        tracked_coins: HashSet<Coin>,
     ) -> Self {
-        let filtered = snapshot.filter_coins(&tracked_coins);
         Self {
             ignore_spot,
             time,
             height,
-            order_book: OrderBooks::from_snapshots(filtered, ignore_triggers),
+            order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             snapped: false,
-            tracked_coins,
         }
     }
 
@@ -57,8 +53,12 @@ impl OrderBookState {
             None
         } else {
             self.snapped = prevent_future_snaps || self.snapped;
-            Some((self.time, compute_l2_snapshots(&self.order_book, &self.tracked_coins)))
+            Some((self.time, compute_l2_snapshots(&self.order_book)))
         }
+    }
+
+    pub(super) fn compute_universe(&self) -> HashSet<Coin> {
+        self.order_book.as_ref().keys().cloned().collect()
     }
 
     pub(super) fn apply_updates(
@@ -93,9 +93,6 @@ impl OrderBookState {
             if coin.is_spot() && self.ignore_spot {
                 continue;
             }
-            if !self.tracked_coins.is_empty() && !self.tracked_coins.contains(&coin) {
-                continue;
-            }
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
                 InnerOrderDiff::New { sz } => {
@@ -127,17 +124,5 @@ impl OrderBookState {
         self.time = time;
         self.snapped = false;
         Ok(())
-    }
-
-    pub(super) fn remove_coin(&mut self, coin: &Coin) {
-        self.order_book.remove_coin(coin);
-    }
-
-    pub(super) fn set_tracked_coins(&mut self, coins: HashSet<Coin>) {
-        self.tracked_coins = coins;
-    }
-
-    pub(super) fn tracked_coins(&self) -> &HashSet<Coin> {
-        &self.tracked_coins
     }
 }
