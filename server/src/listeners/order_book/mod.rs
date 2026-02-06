@@ -195,11 +195,15 @@ fn fetch_snapshot(
                                 warn!("Fetched snapshot (height {}) lagging stored state (height {}). Skipping validation.", height, state.height());
                                 return Ok::<(), Error>(());
                             }
+                            let tracked = listener.lock().await.tracked_coin_set();
+                            if tracked.is_empty() {
+                                info!("No tracked coins, skipping validation at height {}", height);
+                                return Ok::<(), Error>(());
+                            }
                             let stored_snapshot = state.compute_snapshot().snapshot;
                             info!("Validating snapshot at height {}", height);
 
-                            // Option C: Auto-resync on validation mismatch
-                            match validate_snapshot_consistency(&stored_snapshot, expected_snapshot.clone(), ignore_spot) {
+                            match validate_snapshot_consistency(&stored_snapshot, expected_snapshot.clone(), ignore_spot, &tracked) {
                                 Ok(()) => {
                                     info!("Snapshot validation passed at height {}", height);
                                     Ok(())
@@ -236,24 +240,21 @@ pub(crate) struct OrderBookListener {
     fill_status_file: Option<File>,
     order_status_file: Option<File>,
     order_diff_file: Option<File>,
-    // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     last_fill: Option<u64>,
     order_diff_cache: BatchQueue<NodeDataOrderDiff>,
     order_status_cache: BatchQueue<NodeDataOrderStatus>,
-    // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
-    // Track resync statistics
     resync_count: u64,
     last_resync_height: Option<u64>,
-    // Fix #1: Line-buffered reading - incomplete line buffers per event source
     fill_incomplete_line: String,
     order_status_incomplete_line: String,
     order_diff_incomplete_line: String,
-    // Fix #2: Circuit breaker state
     resync_timestamps: VecDeque<SystemTime>,
     degraded_mode_until: Option<SystemTime>,
+    tracked_coins: HashMap<Coin, usize>,
+    coin_universe: HashSet<String>,
 }
 
 impl OrderBookListener {
@@ -278,6 +279,8 @@ impl OrderBookListener {
             // Fix #2: Initialize circuit breaker state
             resync_timestamps: VecDeque::new(),
             degraded_mode_until: None,
+            tracked_coins: HashMap::new(),
+            coin_universe: HashSet::new(),
         }
     }
 
@@ -289,8 +292,45 @@ impl OrderBookListener {
         self.order_book_state.is_some()
     }
 
-    pub(crate) fn universe(&self) -> HashSet<Coin> {
-        self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
+    pub(crate) fn universe(&self) -> &HashSet<String> {
+        &self.coin_universe
+    }
+
+    pub(crate) fn track_coin(&mut self, coin: Coin) -> bool {
+        let count = self.tracked_coins.entry(coin).or_insert(0);
+        *count += 1;
+        let is_new = *count == 1;
+        if is_new {
+            let tracked_set = self.tracked_coin_set();
+            if let Some(state) = &mut self.order_book_state {
+                state.set_tracked_coins(tracked_set);
+            }
+        }
+        is_new
+    }
+
+    pub(crate) fn untrack_coin(&mut self, coin: &Coin) {
+        if let Some(count) = self.tracked_coins.get_mut(coin) {
+            *count -= 1;
+            if *count == 0 {
+                self.tracked_coins.remove(coin);
+                let tracked_set = self.tracked_coin_set();
+                if let Some(state) = &mut self.order_book_state {
+                    state.remove_coin(coin);
+                    state.set_tracked_coins(tracked_set);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn untrack_coins(&mut self, coins: &[Coin]) {
+        for coin in coins {
+            self.untrack_coin(coin);
+        }
+    }
+
+    fn tracked_coin_set(&self) -> HashSet<Coin> {
+        self.tracked_coins.keys().cloned().collect()
     }
 
     #[allow(clippy::type_complexity)]
@@ -376,7 +416,9 @@ impl OrderBookListener {
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("No existing snapshot");
-        let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        self.coin_universe = snapshot.as_ref().keys().map(|c| c.value()).collect();
+        let tracked = self.tracked_coin_set();
+        let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot, tracked);
         let mut retry = false;
         while let Some((order_statuses, order_diffs)) = self.pop_cache() {
             if new_order_book.apply_updates(order_statuses, order_diffs).is_err() {
@@ -494,8 +536,9 @@ impl OrderBookListener {
         self.order_status_cache = BatchQueue::new();
         self.fetched_snapshot_cache = None;
 
-        // Create new orderbook state from the snapshot
-        let new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        self.coin_universe = snapshot.as_ref().keys().map(|c| c.value()).collect();
+        let tracked = self.tracked_coin_set();
+        let new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot, tracked);
 
         // Note: Unlike init_from_snapshot, we don't apply cached updates here
         // because we just cleared them. The next round of file updates will

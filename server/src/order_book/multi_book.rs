@@ -5,7 +5,7 @@ use crate::{
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 use tokio::fs::read_to_string;
@@ -26,6 +26,13 @@ impl<O> Snapshots<O> {
 
     pub(crate) fn value(self) -> HashMap<Coin, Snapshot<O>> {
         self.0
+    }
+
+    pub(crate) fn filter_coins(self, tracked: &HashSet<Coin>) -> Self {
+        if tracked.is_empty() {
+            return Self(HashMap::new());
+        }
+        Self(self.0.into_iter().filter(|(coin, _)| tracked.contains(coin)).collect())
     }
 }
 
@@ -58,7 +65,10 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
     }
 
-    // change size to reflect how much gets matched during the block
+    pub(crate) fn remove_coin(&mut self, coin: &Coin) {
+        self.order_books.remove(coin);
+    }
+
     pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> bool {
         self.order_books.get_mut(&coin).is_some_and(|book| book.modify_sz(oid, sz))
     }
